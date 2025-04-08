@@ -69,6 +69,7 @@ import org.opensearch.env.ShardLockObtainFailedException;
 import org.opensearch.gateway.MetadataStateFormat;
 import org.opensearch.gateway.WriteStateException;
 import org.opensearch.index.analysis.IndexAnalyzers;
+import org.opensearch.index.cache.ClusterIdBoundsCache;
 import org.opensearch.index.cache.IndexCache;
 import org.opensearch.index.cache.bitset.BitsetFilterCache;
 import org.opensearch.index.cache.query.QueryCache;
@@ -150,6 +151,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
     private final IndexEventListener eventListener;
     private final IndexFieldDataService indexFieldData;
     private final BitsetFilterCache bitsetFilterCache;
+    public final ClusterIdBoundsCache clusterIdBoundsCache;
     private final NodeEnvironment nodeEnv;
     private final ShardStoreDeleter shardStoreDeleter;
     private final IndexStorePlugin.DirectoryFactory directoryFactory;
@@ -279,14 +281,16 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
             }
             indexFieldData.setListener(new FieldDataCacheListener(this));
             this.bitsetFilterCache = new BitsetFilterCache(indexSettings, new BitsetCacheListener(this));
-            this.warmer = new IndexWarmer(threadPool, indexFieldData, bitsetFilterCache.createListener(threadPool));
-            this.indexCache = new IndexCache(indexSettings, queryCache, bitsetFilterCache);
+            this.clusterIdBoundsCache = new ClusterIdBoundsCache(indexSettings, new ClusterIdBoundsCacheListener(this));
+            this.indexCache = new IndexCache(indexSettings, queryCache, bitsetFilterCache, clusterIdBoundsCache);
+            this.warmer = new IndexWarmer(threadPool, indexFieldData, bitsetFilterCache.createListener(threadPool), clusterIdBoundsCache.createListener(threadPool));
         } else {
             assert indexAnalyzers == null;
             this.mapperService = null;
             this.indexFieldData = null;
             this.indexSortSupplier = () -> null;
             this.bitsetFilterCache = null;
+            this.clusterIdBoundsCache = null;
             this.warmer = null;
             this.indexCache = null;
         }
@@ -908,6 +912,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
             indexSettings,
             bigArrays,
             indexCache.bitsetFilterCache(),
+            indexCache.clusterIdBoundsCache(),
             indexFieldData::getForField,
             mapperService(),
             similarityService(),
@@ -1013,6 +1018,41 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
         final IndexService indexService;
 
         private BitsetCacheListener(IndexService indexService) {
+            this.indexService = indexService;
+        }
+
+        @Override
+        public void onCache(ShardId shardId, Accountable accountable) {
+            if (shardId != null) {
+                final IndexShard shard = indexService.getShardOrNull(shardId.id());
+                if (shard != null) {
+                    long ramBytesUsed = accountable != null ? accountable.ramBytesUsed() : 0L;
+                    shard.shardBitsetFilterCache().onCached(ramBytesUsed);
+                }
+            }
+        }
+
+        @Override
+        public void onRemoval(ShardId shardId, Accountable accountable) {
+            if (shardId != null) {
+                final IndexShard shard = indexService.getShardOrNull(shardId.id());
+                if (shard != null) {
+                    long ramBytesUsed = accountable != null ? accountable.ramBytesUsed() : 0L;
+                    shard.shardBitsetFilterCache().onRemoval(ramBytesUsed);
+                }
+            }
+        }
+    }
+
+    /**
+     * Cache listener for bitsets
+     *
+     * @opensearch.internal
+     */
+    private static final class ClusterIdBoundsCacheListener implements ClusterIdBoundsCache.Listener {
+        final IndexService indexService;
+
+        private ClusterIdBoundsCacheListener(IndexService indexService) {
             this.indexService = indexService;
         }
 
