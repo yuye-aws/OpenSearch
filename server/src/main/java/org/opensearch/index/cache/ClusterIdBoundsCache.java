@@ -48,8 +48,7 @@ import org.apache.logging.log4j.message.ParameterizedMessage;
  * cluster-based document retrieval.
  */
 @ExperimentalApi
-public final class ClusterIdBoundsCache extends AbstractIndexComponent
-    implements IndexReader.ClosedListener, RemovalListener<IndexReader.CacheKey, Map<ShardId, Map<String, Map<Long, ClusterIdBoundsCache.DocBounds>>>>, Closeable {
+public final class ClusterIdBoundsCache extends AbstractIndexComponent implements IndexReader.ClosedListener, Closeable {
 
 
     private static final String CLUSTER_ID_FIELD = "cluster_id";
@@ -129,30 +128,6 @@ public final class ClusterIdBoundsCache extends AbstractIndexComponent
 
         // Store the cluster map in the segment map
         loadedBounds.put(shardId, segmentMap);
-    }
-
-    @Override
-    public void onRemoval(RemovalNotification<IndexReader.CacheKey, Map<ShardId, Map<String, Map<Long, ClusterIdBoundsCache.DocBounds>>>> notification) {
-        if (notification.getKey() == null) {
-            return;
-        }
-
-        Map<ShardId, Map<String, Map<Long, ClusterIdBoundsCache.DocBounds>>> valueCache = notification.getValue();
-        if (valueCache == null) {
-            return;
-        }
-
-        // Notify listener about all removed bounds
-        for (Map.Entry<ShardId, Map<String, Map<Long, DocBounds>>> valueEntry : valueCache.entrySet()) {
-            ShardId shardId = valueEntry.getKey();
-            Map<String, Map<Long, DocBounds>> segmentMap = valueEntry.getValue();
-
-            for (Map<Long, DocBounds> clusterMap : segmentMap.values()) {
-                for (DocBounds bounds : clusterMap.values()) {
-                    listener.onRemoval(shardId, bounds);
-                }
-            }
-        }
     }
 
     /**
