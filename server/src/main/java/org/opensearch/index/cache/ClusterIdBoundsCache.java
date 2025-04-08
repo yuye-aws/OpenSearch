@@ -53,8 +53,8 @@ public final class ClusterIdBoundsCache extends AbstractIndexComponent
 
 
     private static final String CLUSTER_ID_FIELD = "cluster_id";
-    // loadedBounds[cacheKey][shardId][segmentName][clusterId] = [lower, upper]
-    private final Cache<IndexReader.CacheKey, Map<ShardId, Map<String, Map<Long, DocBounds>>>> loadedBounds;
+    // loadedBounds[shardId][segmentName][clusterId] = [lower, upper]
+    private final Map<ShardId, Map<String, Map<Long, DocBounds>>> loadedBounds;
     private final Listener listener;
 
     public ClusterIdBoundsCache(IndexSettings indexSettings, Listener listener) {
@@ -62,9 +62,7 @@ public final class ClusterIdBoundsCache extends AbstractIndexComponent
         if (listener == null) {
             throw new IllegalArgumentException("listener must not be null");
         }
-        this.loadedBounds = CacheBuilder.<IndexReader.CacheKey, Map<ShardId, Map<String, Map<Long, DocBounds>>>>builder()
-            .removalListener(this)
-            .build();
+        this.loadedBounds = new HashMap<>();
         this.listener = listener;
     }
 
@@ -78,7 +76,7 @@ public final class ClusterIdBoundsCache extends AbstractIndexComponent
 
     @Override
     public void onClose(IndexReader.CacheKey ownerCoreCacheKey) {
-        loadedBounds.invalidate(ownerCoreCacheKey);
+        logger.debug("clearing cache key [{}]", ownerCoreCacheKey);
     }
 
     @Override
@@ -88,7 +86,6 @@ public final class ClusterIdBoundsCache extends AbstractIndexComponent
 
     public void clear(String reason) {
         logger.debug("clearing all cluster bounds because [{}]", reason);
-        loadedBounds.invalidateAll();
     }
 
     private void getClustersBounds(final LeafReaderContext context) throws IOException, ExecutionException {
@@ -96,7 +93,6 @@ public final class ClusterIdBoundsCache extends AbstractIndexComponent
         if (cacheHelper == null) {
             throw new IllegalArgumentException("Reader " + context.reader() + " does not support caching");
         }
-        final IndexReader.CacheKey coreCacheReader = cacheHelper.getKey();
         final ShardId shardId = ShardUtils.extractShardId(context.reader());
         if (indexSettings.getIndex().equals(shardId.getIndex()) == false) {
             throw new IllegalStateException(
@@ -107,12 +103,8 @@ public final class ClusterIdBoundsCache extends AbstractIndexComponent
         SegmentReader segmentReader = Lucene.segmentReader(context.reader());
         String segmentName = segmentReader.getSegmentName();
 
-        // Get or create the shard map for this cache key
-        Map<ShardId, Map<String, Map<Long, DocBounds>>> shardMap = loadedBounds.computeIfAbsent(
-            coreCacheReader, k -> new HashMap<>());
-
         // Get or create the segment map for this shard
-        Map<String, Map<Long, DocBounds>> segmentMap = shardMap.computeIfAbsent(
+        Map<String, Map<Long, DocBounds>> segmentMap = loadedBounds.computeIfAbsent(
             shardId, k -> new HashMap<>());
 
         // Create the cluster map for this segment
@@ -136,7 +128,7 @@ public final class ClusterIdBoundsCache extends AbstractIndexComponent
         }
 
         // Store the cluster map in the segment map
-        segmentMap.put(segmentName, clusterMap);
+        loadedBounds.put(shardId, segmentMap);
     }
 
     @Override
@@ -238,7 +230,7 @@ public final class ClusterIdBoundsCache extends AbstractIndexComponent
         }
     }
 
-    public Cache<IndexReader.CacheKey, Map<ShardId, Map<String, Map<Long, DocBounds>>>> getLoadedBounds() {
+    public Map<ShardId, Map<String, Map<Long, DocBounds>>> getLoadedBounds() {
         return loadedBounds;
     }
 
