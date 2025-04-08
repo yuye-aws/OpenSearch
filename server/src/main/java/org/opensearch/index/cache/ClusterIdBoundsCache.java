@@ -125,9 +125,12 @@ public final class ClusterIdBoundsCache extends AbstractIndexComponent implement
             }
             doc = docValues.nextDoc();
         }
+        segmentMap.put(segmentName, clusterMap);
 
         // Store the cluster map in the segment map
-        loadedBounds.put(shardId, segmentMap);
+        if (!loadedBounds.containsKey(shardId)) {
+            loadedBounds.put(shardId, segmentMap);
+        }
     }
 
     /**
