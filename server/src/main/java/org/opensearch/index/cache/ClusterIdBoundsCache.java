@@ -8,6 +8,7 @@
 
 package org.opensearch.index.cache;
 
+import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.index.DocValues;
@@ -20,6 +21,7 @@ import org.opensearch.common.cache.Cache;
 import org.opensearch.common.cache.CacheBuilder;
 import org.opensearch.common.cache.RemovalListener;
 import org.opensearch.common.cache.RemovalNotification;
+import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.AbstractIndexComponent;
 import org.opensearch.index.IndexSettings;
@@ -35,6 +37,7 @@ import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import org.apache.logging.log4j.message.ParameterizedMessage;
 
@@ -46,11 +49,12 @@ import org.apache.logging.log4j.message.ParameterizedMessage;
  */
 @ExperimentalApi
 public final class ClusterIdBoundsCache extends AbstractIndexComponent
-    implements IndexReader.ClosedListener, RemovalListener<IndexReader.CacheKey, Map<Long, ClusterIdBoundsCache.Value>>, Closeable {
+    implements IndexReader.ClosedListener, RemovalListener<IndexReader.CacheKey, Map<ShardId, Map<String, Map<Long, ClusterIdBoundsCache.DocBounds>>>>, Closeable {
 
 
     private static final String CLUSTER_ID_FIELD = "cluster_id";
-    private final Cache<IndexReader.CacheKey, Map<Long, Value>> loadedBounds;
+    // loadedBounds[cacheKey][shardId][segmentName][clusterId] = [lower, upper]
+    private final Cache<IndexReader.CacheKey, Map<ShardId, Map<String, Map<Long, DocBounds>>>> loadedBounds;
     private final Listener listener;
 
     public ClusterIdBoundsCache(IndexSettings indexSettings, Listener listener) {
@@ -58,7 +62,9 @@ public final class ClusterIdBoundsCache extends AbstractIndexComponent
         if (listener == null) {
             throw new IllegalArgumentException("listener must not be null");
         }
-        this.loadedBounds = CacheBuilder.<IndexReader.CacheKey, Map<Long, Value>>builder().removalListener(this).build();
+        this.loadedBounds = CacheBuilder.<IndexReader.CacheKey, Map<ShardId, Map<String, Map<Long, DocBounds>>>>builder()
+            .removalListener(this)
+            .build();
         this.listener = listener;
     }
 
@@ -85,7 +91,7 @@ public final class ClusterIdBoundsCache extends AbstractIndexComponent
         loadedBounds.invalidateAll();
     }
 
-    private void getClustersBounds(final LeafReaderContext context) throws IOException {
+    private void getClustersBounds(final LeafReaderContext context) throws IOException, ExecutionException {
         final IndexReader.CacheHelper cacheHelper = FilterLeafReader.unwrap(context.reader()).getCoreCacheHelper();
         if (cacheHelper == null) {
             throw new IllegalArgumentException("Reader " + context.reader() + " does not support caching");
@@ -98,35 +104,61 @@ public final class ClusterIdBoundsCache extends AbstractIndexComponent
             );
         }
 
-        Map<Long, Value> clusterToBounds = new HashMap<>();
+        SegmentReader segmentReader = Lucene.segmentReader(context.reader());
+        String segmentName = segmentReader.getSegmentName();
+
+        // Get or create the shard map for this cache key
+        Map<ShardId, Map<String, Map<Long, DocBounds>>> shardMap = loadedBounds.computeIfAbsent(
+            coreCacheReader, k -> new HashMap<>());
+
+        // Get or create the segment map for this shard
+        Map<String, Map<Long, DocBounds>> segmentMap = shardMap.computeIfAbsent(
+            shardId, k -> new HashMap<>());
+
+        // Create the cluster map for this segment
+        Map<Long, DocBounds> clusterMap = new HashMap<>();
+
+        // Populate the cluster map
         SortedNumericDocValues docValues = DocValues.getSortedNumeric(context.reader(), CLUSTER_ID_FIELD);
         int doc = docValues.nextDoc();
         while (doc != DocIdSetIterator.NO_MORE_DOCS) {
-            long value = docValues.nextValue();
-            if (clusterToBounds.containsKey(value)) {
-                clusterToBounds.get(value).bounds.upperBound = doc + 1;
+            long clusterId = docValues.nextValue();
+            DocBounds bounds = clusterMap.get(clusterId);
+            if (bounds != null) {
+                bounds.upperBound = doc + 1;
             } else {
-                clusterToBounds.put(value, new Value(new DocBounds(doc, doc + 1), shardId));
+                bounds = new DocBounds(doc, doc + 1);
+                clusterMap.put(clusterId, bounds);
+                // Notify listener about new cached bounds
+                listener.onCache(shardId, bounds);
             }
             doc = docValues.nextDoc();
         }
-        loadedBounds.put(coreCacheReader, clusterToBounds);
+
+        // Store the cluster map in the segment map
+        segmentMap.put(segmentName, clusterMap);
     }
 
     @Override
-    public void onRemoval(RemovalNotification<IndexReader.CacheKey, Map<Long, Value>> notification) {
+    public void onRemoval(RemovalNotification<IndexReader.CacheKey, Map<ShardId, Map<String, Map<Long, ClusterIdBoundsCache.DocBounds>>>> notification) {
         if (notification.getKey() == null) {
             return;
         }
 
-        Map<Long, Value> valueCache = notification.getValue();
+        Map<ShardId, Map<String, Map<Long, ClusterIdBoundsCache.DocBounds>>> valueCache = notification.getValue();
         if (valueCache == null) {
             return;
         }
 
-        for (Value value : valueCache.values()) {
-            if (value != null) {
-                listener.onRemoval(value.shardId, value.bounds);
+        // Notify listener about all removed bounds
+        for (Map.Entry<ShardId, Map<String, Map<Long, DocBounds>>> valueEntry : valueCache.entrySet()) {
+            ShardId shardId = valueEntry.getKey();
+            Map<String, Map<Long, DocBounds>> segmentMap = valueEntry.getValue();
+
+            for (Map<Long, DocBounds> clusterMap : segmentMap.values()) {
+                for (DocBounds bounds : clusterMap.values()) {
+                    listener.onRemoval(shardId, bounds);
+                }
             }
         }
     }
@@ -206,7 +238,7 @@ public final class ClusterIdBoundsCache extends AbstractIndexComponent
         }
     }
 
-    public Cache<IndexReader.CacheKey, Map<Long, Value>> getLoadedBounds() {
+    public Cache<IndexReader.CacheKey, Map<ShardId, Map<String, Map<Long, DocBounds>>>> getLoadedBounds() {
         return loadedBounds;
     }
 
